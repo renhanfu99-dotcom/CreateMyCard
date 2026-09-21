@@ -118,7 +118,7 @@ from services.generation_pipeline import (
     QualityIssue,
     get_dsl_processor,
 )
-from services.ids_client import IDSClient, IDSDeviceCapabilityState
+from services.ids_client import IDSClient, IDSDeviceCapabilityState, describe_ids_error
 from services.prompt_builder import PromptBuilder
 from services.protocol_registry import A2UIProtocolRegistry
 from services.response_planner import ResponsePlanner
@@ -771,6 +771,113 @@ def test_ids_parser_ignores_provider_intent_and_permission_namespaces():
     assert not hasattr(state, "providers")
     assert not hasattr(state, "intent_targets")
     assert not hasattr(state, "permissions")
+
+
+@pytest.mark.parametrize(
+    ("ret_code", "expected_description"),
+    [
+        (2, "参数非法"),
+        (13, "鉴权失败"),
+        (413302, "SDS表参数非法"),
+        (413399, "SDS处理失败"),
+        (64001, "DCS健康检查失败"),
+        (64099, "DCS处理失败"),
+        (80002, "DMQ消息发送失败"),
+        (80099, "DMQ处理失败"),
+        (300000, "CSS检索结果为空"),
+        (999999, "未知 IDS 错误"),
+    ],
+)
+def test_ids_error_code_description(ret_code, expected_description):
+    assert describe_ids_error(ret_code) == expected_description
+
+
+def test_ids_business_error_response_returns_empty_namespaces():
+    client = IDSClient()
+
+    payload = client._validate_business_response(
+        {"retCode": 13, "description": "IdsSign invalid", "nameSpaces": []},
+        "ids-business-error-1",
+    )
+
+    assert payload == {"nameSpaces": []}
+
+
+def test_ids_parser_skips_failed_namespace_and_keeps_successful_namespace():
+    state = IDSClient()._parse_ids_payload(
+        {
+            "retCode": 0,
+            "nameSpaces": [
+                {
+                    "retCode": 413307,
+                    "description": "table not found",
+                    "dataType": "t_ids_kv_ohos_installed_apps",
+                    "values": [{"data": {"bundleName": "com.should.not.exist"}}],
+                },
+                {
+                    "retCode": 0,
+                    "dataType": "t_ids_kv_ohos_installed_apps",
+                    "values": [{"data": {"bundleName": "com.huawei.hmos.health"}}],
+                },
+            ],
+        }
+    )
+
+    assert state.installed_apps == {"com.huawei.hmos.health"}
+
+
+def test_ids_parser_supports_real_namespaces_values_response():
+    state = IDSClient()._parse_ids_payload(
+        {
+            "retCode": 0,
+            "description": "OK",
+            "nameSpaces": [
+                {
+                    "retCode": 0,
+                    "description": "OK",
+                    "dataType": "t_ids_kv_ohos_installed_apps",
+                    "values": [
+                        {
+                            "data": {
+                                "bundleName": "com.huawei.hmsapp.samplemanagement",
+                            },
+                            "updateTime": "1777084234041",
+                        },
+                        {
+                            "data": {
+                                "bundleName": "com.huawei.hmos.screenshot",
+                            },
+                            "updateTime": "1777084251333",
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert state.installed_apps == {
+        "com.huawei.hmsapp.samplemanagement",
+        "com.huawei.hmos.screenshot",
+    }
+
+
+def test_ids_parser_compatibly_reads_result_sets_data_value():
+    state = IDSClient()._parse_ids_payload(
+        {
+            "retCode": 0,
+            "resultSets": [
+                {"dataValue": '{"bundleName":"com.huawei.hmos.health"}'},
+                {
+                    "dataValue": '[{"bundleName":"com.huawei.hmos.calendar"}]',
+                },
+            ],
+        }
+    )
+
+    assert state.installed_apps == {
+        "com.huawei.hmos.health",
+        "com.huawei.hmos.calendar",
+    }
 
 
 @pytest.mark.parametrize(

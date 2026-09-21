@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -26,6 +27,54 @@ from services.json_loader import load_json
 from utils.base_utils import sts_config
 
 _MODULE = "[IDS Client]"
+
+# IDS 业务错误码。范围错误码（SDS/DCS/DMQ）在精确码未维护时使用范围描述。
+IDS_ERROR_DESCRIPTIONS: dict[int, str] = {
+    2: "参数非法",
+    6: "华为账号认证失败",
+    7: "访问被流控",
+    8: "访问被流控",
+    13: "鉴权失败",
+    10000: "内部通用错误",
+    10001: "服务执行异常",
+    10003: "服务执行超时",
+    10018: "MySQL处理失败",
+    300000: "CSS检索结果为空",
+    413302: "SDS表参数非法",
+    413307: "SDS表不存在",
+    413326: "SDS黑名单拦截",
+    64001: "DCS健康检查失败",
+    64002: "DCS请求失败",
+    80002: "DMQ消息发送失败",
+    80003: "DMQ订阅消息失败",
+}
+
+
+def describe_ids_error(ret_code: Any) -> str:
+    """返回 IDS 错误码的可读描述，未知码保留其所属处理模块。"""
+    try:
+        code = int(ret_code)
+    except (TypeError, ValueError):
+        return "未知 IDS 错误"
+
+    exact_description = IDS_ERROR_DESCRIPTIONS.get(code)
+    if exact_description:
+        return exact_description
+    if 400000 <= code < 500000:
+        return "SDS处理失败"
+    if 60000 <= code < 70000:
+        return "DCS处理失败"
+    if 80000 <= code < 90000:
+        return "DMQ处理失败"
+    return "未知 IDS 错误"
+
+
+def _is_success_ret_code(ret_code: Any) -> bool:
+    """兼容 IDS 将 retCode 编码为整数或数字字符串的响应。"""
+    try:
+        return int(ret_code) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -240,6 +289,7 @@ class IDSClient:
                     f"response_type={type(payload).__name__}"
                 )
                 return {"nameSpaces": []}
+            payload = self._validate_business_response(payload, request_id)
             logger.debug(
                 f"{_MODULE} ids_remote_query_payload_loaded request_id={request_id} "
                 f"namespace_count={len(payload.get('nameSpaces', []))}"
@@ -252,6 +302,60 @@ class IDSClient:
                 f"traceback={traceback.format_exc()}"
             )
             return {"nameSpaces": []}
+
+    def _describe_ids_error(self, ret_code: Any) -> str:
+        """返回 IDS 错误码描述，保留实例方法以便调用方和测试复用。"""
+        return describe_ids_error(ret_code)
+
+    def _validate_business_response(
+        self,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        """校验 IDS 业务层返回码，并过滤失败的 namespace。"""
+        top_level_ret_code = payload.get("retCode")
+        if top_level_ret_code is not None and not _is_success_ret_code(top_level_ret_code):
+            logger.error(
+                f"{_MODULE} ids_business_error request_id={request_id} "
+                f"scope=top ret_code={top_level_ret_code} "
+                f"description={payload.get('description', '')} "
+                f"error_description={self._describe_ids_error(top_level_ret_code)}"
+            )
+            return {"nameSpaces": []}
+
+        namespaces = payload.get("nameSpaces", [])
+        if not isinstance(namespaces, list):
+            logger.error(
+                f"{_MODULE} ids_invalid_namespaces request_id={request_id} "
+                f"response_type={type(namespaces).__name__}"
+            )
+            return {"nameSpaces": []}
+
+        valid_namespaces: list[dict[str, Any]] = []
+        for namespace in namespaces:
+            if not isinstance(namespace, dict):
+                logger.error(
+                    f"{_MODULE} ids_invalid_namespace request_id={request_id} "
+                    f"response_type={type(namespace).__name__}"
+                )
+                continue
+            namespace_ret_code = namespace.get("retCode")
+            if namespace_ret_code is not None and not _is_success_ret_code(namespace_ret_code):
+                logger.error(
+                    f"{_MODULE} ids_business_error request_id={request_id} "
+                    f"scope=namespace data_type={namespace.get('dataType', '')} "
+                    f"ret_code={namespace_ret_code} "
+                    f"description={namespace.get('description', '')} "
+                    f"error_description={self._describe_ids_error(namespace_ret_code)}"
+                )
+                continue
+            valid_namespaces.append(namespace)
+
+        if len(valid_namespaces) == len(namespaces):
+            return payload
+        normalized_payload = dict(payload)
+        normalized_payload["nameSpaces"] = valid_namespaces
+        return normalized_payload
 
     def _safe_headers_for_log(self, ids_query: IDSHttpRequest) -> dict[str, Any]:
         """生成可打印的 IDS 请求头。
@@ -273,20 +377,47 @@ class IDSClient:
         出参：转换后的设备能力状态。
         """
         installed_apps: set[str] = set()
+        if not isinstance(payload, dict):
+            return IDSDeviceCapabilityState()
 
-        for namespace in payload.get("nameSpaces", []):
-            data_type = namespace.get("dataType", "")
-            values = namespace.get("values", [])
+        top_level_ret_code = payload.get("retCode")
+        if top_level_ret_code is not None and not _is_success_ret_code(top_level_ret_code):
+            logger.error(
+                f"{_MODULE} ids_payload_business_error scope=top "
+                f"ret_code={top_level_ret_code} "
+                f"description={payload.get('description', '')} "
+                f"error_description={self._describe_ids_error(top_level_ret_code)}"
+            )
+            return IDSDeviceCapabilityState()
 
-            if data_type == "t_ids_kv_ohos_installed_apps":
-                installed_apps.update(self._collect_installed_apps(values))
+        namespaces = payload.get("nameSpaces", [])
+        if isinstance(namespaces, list):
+            for namespace in namespaces:
+                if not isinstance(namespace, dict):
+                    continue
+                namespace_ret_code = namespace.get("retCode")
+                if namespace_ret_code is not None and not _is_success_ret_code(namespace_ret_code):
+                    logger.error(
+                        f"{_MODULE} ids_payload_business_error scope=namespace "
+                        f"data_type={namespace.get('dataType', '')} "
+                        f"ret_code={namespace_ret_code} "
+                        f"description={namespace.get('description', '')} "
+                        f"error_description={self._describe_ids_error(namespace_ret_code)}"
+                    )
+                    continue
+                data_type = namespace.get("dataType", "")
+                values = namespace.get("values", [])
+                if data_type == "t_ids_kv_ohos_installed_apps":
+                    installed_apps.update(self._collect_installed_apps(values))
+
+        installed_apps.update(self._collect_result_set_apps(payload.get("resultSets")))
 
         logger.debug(
             f"{_MODULE} ids_payload_parsed installed_app_count={len(installed_apps)}"
         )
         return IDSDeviceCapabilityState(installed_apps=installed_apps)
 
-    def _collect_installed_apps(self, values: list[dict[str, Any]]) -> set[str]:
+    def _collect_installed_apps(self, values: Any) -> set[str]:
         """从 IDS values 中收集已安装应用。
 
         入参：
@@ -294,9 +425,48 @@ class IDSClient:
         出参：已安装应用包名集合。
         """
         installed_apps: set[str] = set()
+        if not isinstance(values, list):
+            return installed_apps
         for value in values:
+            if not isinstance(value, dict):
+                continue
             data = value.get("data", {})
+            if not isinstance(data, dict):
+                continue
             bundle_name = data.get("bundleName")
-            if bundle_name:
+            if isinstance(bundle_name, str) and bundle_name:
                 installed_apps.add(bundle_name)
+        return installed_apps
+
+    def _collect_result_set_apps(self, result_sets: Any) -> set[str]:
+        """兼容旧版 resultSets/dataValue 响应，提取明确的 bundleName 字段。"""
+        installed_apps: set[str] = set()
+        if not isinstance(result_sets, list):
+            return installed_apps
+        for result_set in result_sets:
+            if not isinstance(result_set, dict):
+                continue
+            data_value = result_set.get("dataValue")
+            if isinstance(data_value, str):
+                try:
+                    data_value = json.loads(data_value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"{_MODULE} ids_result_set_data_value_invalid "
+                        f"data_type={type(data_value).__name__}"
+                    )
+                    continue
+            if isinstance(data_value, dict):
+                bundle_name = data_value.get("bundleName")
+                if isinstance(bundle_name, str) and bundle_name:
+                    installed_apps.add(bundle_name)
+                installed_apps.update(self._collect_installed_apps([data_value]))
+            elif isinstance(data_value, list):
+                for item in data_value:
+                    if not isinstance(item, dict):
+                        continue
+                    bundle_name = item.get("bundleName")
+                    if isinstance(bundle_name, str) and bundle_name:
+                        installed_apps.add(bundle_name)
+                    installed_apps.update(self._collect_installed_apps([item]))
         return installed_apps
