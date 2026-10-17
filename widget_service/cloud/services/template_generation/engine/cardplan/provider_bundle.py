@@ -145,6 +145,7 @@ _PROVIDER_TEMPLATE_FAMILIES = (
     "SleepOverview",
     "GenericMetricOverview",
     "DateOverview",
+    "CurrentTimeOverview",
 )
 
 
@@ -197,6 +198,15 @@ class ProviderTemplateEntry(StrictModel):
         default_factory=dict, alias="assetParameterSemanticTags"
     )
     supported_event_ids: tuple[str, ...] = Field(default=(), alias="supportedEventIds")
+    # Most business-template sizes are derived from the template suffix.  A
+    # small number of legacy templates have a `Full`/`Compact` suffix but are
+    # authored for a wide 2x4 slot (for example a three-day forecast).  These
+    # entries may explicitly override the suffix-derived size without
+    # changing the public template id.
+    declared_supported_card_sizes: tuple[Literal["2x2", "2x4"], ...] | None = Field(
+        default=None,
+        alias="supportedCardSizes",
+    )
     size_scoped_hidden_parameters: dict[str, tuple[str, ...]] = Field(
         default_factory=dict,
         alias="sizeScopedHiddenParameters",
@@ -219,6 +229,17 @@ class ProviderTemplateEntry(StrictModel):
                     raise ValueError(
                         f"Provider sizeScopedHiddenParameters name is invalid: {name}"
                     )
+        return self
+
+    @model_validator(mode="after")
+    def declared_sizes_are_valid(self) -> ProviderTemplateEntry:
+        sizes = self.declared_supported_card_sizes
+        if sizes is None:
+            return self
+        if self.capability_id is None:
+            raise ValueError("Provider supportedCardSizes requires a business Template")
+        if not sizes or len(sizes) != len(set(sizes)):
+            raise ValueError("Provider supportedCardSizes must be nonempty and unique")
         return self
 
     @model_validator(mode="after")
@@ -281,6 +302,8 @@ class ProviderTemplateEntry(StrictModel):
     def supported_card_sizes(self) -> tuple[Literal["2x2", "2x4"], ...]:
         if self.capability_id is None:
             return ()
+        if self.declared_supported_card_sizes is not None:
+            return self.declared_supported_card_sizes
         layout_kind = _provider_template_layout_kind(self.template_id)
         return (
             ("2x4",)
@@ -1559,6 +1582,11 @@ _ASSET_SEMANTIC_TERMS = {
     "audio": ("audio", "music", "earphone", "headphone", "音频", "音乐", "耳机"),
     "earphone": ("earphone", "earbud", "headphone", "耳机", "耳塞"),
     "earphone-body": ("耳机本体", "左右分体", "earphone body", "earbuds body"),
+    "earphone-left": ("左耳", "左声道", "left ear", "left channel"),
+    "earphone-right": ("右耳", "右声道", "right ear", "right channel"),
+    "bluetooth-device": (
+        "bluetooth", "蓝牙", "耳机本体", "左右分体", "earphone body", "earbuds body",
+    ),
     "earphone-case": ("耳机收纳盒", "耳机充电盒", "earphone case", "earbud case"),
     "app-icon": ("应用图标", "品牌", "app icon"),
     "phone-device": ("smartphone", "phone icon", "icon_phone", "手机图标"),

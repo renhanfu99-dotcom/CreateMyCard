@@ -32,6 +32,7 @@ from custom.a2ui_model_client import (
 )
 from custom.model_runtime import ModelExecutionRuntime
 from models.artifact import ArtifactMeta, GenerationPlan, WidgetArtifact
+from models.capability import AssetCapabilityOverview
 from models.generation import DEFAULT_WIDGET_SIZE, ModelRequestContext, WidgetSize
 from models.preflight import GenerationPreflightError
 from services.artifact_store import ArtifactStore, RepairArtifactRecord
@@ -187,7 +188,13 @@ class WidgetGenerationService:
                 for item in data_capabilities
             ],
             eventCapabilities=event_capabilities,
-            assetCandidates=asset_capabilities,
+            assetCandidates=[
+                AssetCapabilityOverview(
+                    id=item.id,
+                    description=item.overviewDescription or item.description,
+                )
+                for item in asset_capabilities
+            ],
             unavailableCapabilities=[item.id for item in removed],
         )
         logger.info(
@@ -690,6 +697,9 @@ class WidgetGenerationService:
             from services.prompt_builder import PromptBuilder
 
             nonlocal model_call_phase, quality_repair_attempt_count
+            nonlocal source_generated_by_template
+            # 模型修复阶段切换回模型组件规则。
+            source_generated_by_template = False
             quality_repair_attempt_count += 1
             quality_error_payloads = [
                 asset_mapper.restore_diagnostic_values(item.to_prompt_payload())

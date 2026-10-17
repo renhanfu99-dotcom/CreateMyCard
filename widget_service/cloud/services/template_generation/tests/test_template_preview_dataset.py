@@ -20,20 +20,20 @@ def test_template_preview_dataset_covers_all_business_templates(tmp_path):
     cases = manifest.get("cases")
     assert isinstance(cases, list)
 
-    assert manifest.get("templateCount") == 189
+    assert manifest.get("templateCount") == 230
     assert manifest.get("countsByLayout") == {
         "HeroTitle": 1,
         "HeroContent": 1,
-        "Support": 21,
-        "Compact": 24,
+        "Support": 30,
+        "Compact": 21,
         "Hero": 52,
-        "Full": 64,
+        "Full": 89,
         "WideHero": 5,
-        "WideFull": 18,
+        "WideFull": 28,
         "WideHalf": 3,
     }
-    assert manifest.get("countsBySize") == {"2x2": 163, "2x4": 26}
-    assert len(cases) == 189
+    assert manifest.get("countsBySize") == {"2x2": 191, "2x4": 39}
+    assert len(cases) == 230
     template_ids: set[str] = set()
     for case in cases:
         template_id = case.get("templateId")
@@ -42,10 +42,20 @@ def test_template_preview_dataset_covers_all_business_templates(tmp_path):
         assert isinstance(file_name, str)
         template_ids.add(template_id)
         assert (tmp_path / file_name).is_file()
-    assert len(template_ids) == 189
+    assert len(template_ids) == 230
     assert {
         "BluetoothDeviceOverviewEarbudTripleHero@1",
     }.issubset(template_ids)
+
+
+def test_explicit_wide_only_weather_preview_uses_2x4():
+    case = next(
+        item
+        for item in build_template_preview_cases()
+        if item.template_id == "WeatherOverviewThreeDayForecastFull@1"
+    )
+
+    assert case.size == "2x4"
 
 
 def test_template_preview_a2ui_has_surface_components_and_data():
@@ -106,7 +116,6 @@ def test_template_preview_assets_are_bundled_by_genui_evaluation():
         "clock_fill.svg",
         "earphone_case_16644.svg",
         "drop_1.svg",
-        "externaldrive_fill.svg",
         "figure_run.svg",
         "flame_fill.svg",
         "heart_fill.svg",
@@ -184,7 +193,7 @@ def test_template_preview_manifest_data_tiers_are_disjoint():
                 "/location/prefectureName", "/location/districtName",
                 "/location/cityCode",
             )
-        elif case.template_id == "BluetoothDeviceOverviewMusicCompact@1":
+        elif case.template_id == "BluetoothDeviceOverviewMusicSupport@1":
             # 纯歌单入口：不渲染任何耳机数据，三级数据均为空。
             assert case.primary_data == ()
             assert case.secondary_data == ()
@@ -304,7 +313,7 @@ def test_earphone_ring_previews_include_required_device_icon(template_id, icon_n
         pytest.fail("图标必须与电量环位于同一个 Stack")
 
 
-def test_battery_2x2_icon_contracts_and_previews_are_required():
+def test_battery_2x2_icon_contracts_and_previews_match_declared_requirements():
     registry = get_cardplan_registry()
     covered = set()
     for case in build_template_preview_cases():
@@ -317,7 +326,10 @@ def test_battery_2x2_icon_contracts_and_previews_are_required():
         assert isinstance(properties, dict)
         if "batteryIcon" not in properties:
             continue
-        assert "batteryIcon" in variant.parameters_schema.get("required", [])
+        if case.template_id == "BatteryOverviewFull@1":
+            assert "batteryIcon" not in variant.parameters_schema.get("required", [])
+        else:
+            assert "batteryIcon" in variant.parameters_schema.get("required", [])
         update = case.messages[1].get("updateComponents")
         assert isinstance(update, dict)
         components = update.get("components")
@@ -349,3 +361,51 @@ def test_battery_wide_and_support_icons_remain_optional():
     ):
         variant = registry.require_variant(template_id, "default")
         assert "batteryIcon" not in variant.parameters_schema.get("required", [])
+
+
+def test_weather_rain_previews_keep_numbers_and_format_text_units():
+    registry = get_cardplan_registry()
+    covered: set[str] = set()
+    for case in build_template_preview_cases():
+        if case.business_id != "WeatherOverview":
+            continue
+        definition = registry.require_template(case.template_id)
+        rain_bindings = []
+        for binding in definition.bindings.values():
+            if binding.path.endswith("/rainProbabilityPercent"):
+                assert binding.data_type == "number"
+                rain_bindings.append(binding)
+        if not rain_bindings:
+            continue
+        covered.add(case.template_id)
+        data_message = case.messages[2].get("updateDataModel")
+        assert isinstance(data_message, dict)
+        data = data_message.get("value")
+        assert isinstance(data, dict)
+        weather = data.get("data", {}).get("weather", {})
+        daily = weather.get("daily")
+        assert isinstance(daily, list)
+        for item in daily:
+            if not isinstance(item, dict) or "rainProbabilityPercent" not in item:
+                continue
+            probability = item.get("rainProbabilityPercent")
+            assert isinstance(probability, (int, float))
+            assert not isinstance(probability, bool)
+        component_message = case.messages[1].get("updateComponents")
+        assert isinstance(component_message, dict)
+        components = component_message.get("components")
+        assert isinstance(components, list)
+        rain_text_count = 0
+        for component in components:
+            if component.get("component") == "Progress":
+                value = component.get("value")
+                if isinstance(value, str) and "rainProbabilityPercent" in value:
+                    assert "%" not in value
+            content = component.get("content")
+            if not isinstance(content, str) or "rainProbabilityPercent" not in content:
+                continue
+            assert component.get("component") == "Text"
+            assert content.count("%") == 1
+            rain_text_count += 1
+        assert rain_text_count > 0
+    assert len(covered) == 9

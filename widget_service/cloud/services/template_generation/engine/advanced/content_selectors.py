@@ -71,6 +71,31 @@ _SCHEDULE_TEMPLATE_VARIANT_SPECS: tuple[
         ),
     ),
     (
+        "reminderSource",
+        (
+            ("senderName", "/events/0/senderName", "string", True),
+            ("remindTime", "/events/0/remindTime/0", "string", False),
+        ),
+    ),
+    (
+        "allDayLocation",
+        (
+            ("title", "/events/0/title", "string", False),
+            ("isAllDay", "/events/0/isAllDay", "boolean", False),
+            ("eventLocation", "/events/0/eventLocation", "string", False),
+        ),
+    ),
+    (
+        "eventCountDatedLocation",
+        (
+            ("eventCount", "/eventCount", "integer", False),
+            ("title", "/events/0/title", "string", False),
+            ("startDate", "/events/0/startDate", "string", False),
+            ("dtStart", "/events/0/dtStart", "string", False),
+            ("eventLocation", "/events/0/eventLocation", "string", False),
+        ),
+    ),
+    (
         "eventCountDetails",
         (
             ("eventCount", "/eventCount", "integer", False),
@@ -84,6 +109,7 @@ _SCHEDULE_TEMPLATE_VARIANT_SPECS: tuple[
 _SCHEDULE_VARIANT_ALLOWED_UNSUPPORTED_TERMS: dict[str, frozenset[str]] = {
     "locationDescriptionEnd": frozenset({"备注", "memo"}),
     "reminderDetails": frozenset({"邀请人", "发起人", "sender name"}),
+    "reminderSource": frozenset({"邀请人", "发起人", "sender name"}),
     "eventCountDetails": frozenset({"备注", "memo"}),
 }
 
@@ -123,10 +149,19 @@ _SELECTOR_FALLBACK_FIELDS: dict[str, tuple[str, ...]] = {
         "districtName",
         "prefectureName",
         "airQuality",
+        "uvIndex",
         "coldLevel",
         "temperatureRangeText",
+        "rainProbabilityPercent",
+        "date",
+        "weekday",
         "alertLevel",
         "updatedAt",
+        # 风况模板族（WindFull/WindHero primaryData、RainWindFull secondaryData）的
+        # 可渲染事实——严格四要素天气 selector 缺席（仅风况/降水+风况最小输入）时，
+        # 直连叶子回退仍须投影出所选模板实际渲染的风况字段。
+        "windDirection",
+        "windLevel",
     ),
     "DateOverview": ("startDate", "weekday"),
     "ScheduleOverview": ("title", "dtStart", "dtEnd", "eventLocation"),
@@ -180,6 +215,7 @@ _PROVIDER_COMPONENT_FIELDS: dict[str, tuple[str, ...]] = {
         "chargingStatusDesc",
     ),
     "CountdownOverview": ("countdownDays",),
+    "CurrentTimeOverview": ("currentDate", "dayOfWeek", "lunarDate", "updatedAt"),
 }
 
 
@@ -730,6 +766,8 @@ _SCHEDULE_QUERY_TERMS = (
     "会议",
     "下一项",
     "下一场",
+    "下个安排",
+    "下一个安排",
     "预约",
     "入会",
 )
@@ -1002,6 +1040,9 @@ _WORKOUT_GENERIC_QUERY_TERMS = (
     "锻炼",
     "训练",
     "健身",
+    "跑步",
+    "跑了",
+    "练了",
 )
 _COUNTDOWN_QUERY_TERMS = (
     "countdown",
@@ -1046,6 +1087,16 @@ _UNSUPPORTED_WORKOUT_QUERY_TERMS = (
     "总里程",
     "完成率",
     "运动进度",
+)
+
+# WorkoutOverview 的提供方输出字段，作为首层 requiredOutputFields 语义意图的判定依据。
+_WORKOUT_OUTPUT_FIELD_NAMES = frozenset(
+    (
+        "exerciseDurationText",
+        "exerciseCalorieText",
+        "exerciseEndTimeText",
+        "exerciseTypeName",
+    )
 )
 
 _HEART_RATE_AVERAGE_QUERY_TERMS = (
@@ -1567,6 +1618,16 @@ def project_content_component_facts(
                 if advanced_component_data_admission_is_relaxed()
                 else workout_overview_variants(task_spec, capability_ids)
             )
+            if not workout_variants and _requests_workout_fields(
+                required_output_fields_by_capability
+            ):
+                # WorkoutOverview 已由首层按语义意图（requiredOutputFields）选入
+                # scope，上面的原始 query 词条只是启发式，会漏掉口语表述
+                # （如“健完身”“跑步”不在词条表内）。此处信任首层意图回退到宽松
+                # 变体，但保留数据门：仍须成功提取最近运动事实，否则照常抛错。
+                workout_variants = relaxed_workout_overview_variants(
+                    task_spec, capability_ids
+                )
             if "latest" in workout_variants:
                 latest_facts = extract_workout_latest_facts(schema)
                 if latest_facts is not None:
@@ -1706,6 +1767,17 @@ def _provider_fields(component_id: str, capability_ids: set[str]) -> tuple[str, 
             )
         )
     return tuple(fields)
+
+
+def _requests_workout_fields(
+    required_output_fields_by_capability: dict[str, tuple[str, ...]] | None,
+) -> bool:
+    """True when the first-layer intent requests any WorkoutOverview display field."""
+    return any(
+        path.rsplit("/", 1)[-1] in _WORKOUT_OUTPUT_FIELD_NAMES
+        for paths in (required_output_fields_by_capability or {}).values()
+        for path in paths
+    )
 
 
 def _select_direct_fields(value: Any, field_names: tuple[str, ...]) -> dict[str, Any]:

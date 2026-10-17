@@ -27,12 +27,14 @@ from services.template_generation.engine.cardplan.retrieval_index import (
 from services.template_generation.engine.cardplan.template_retrieval import (
     TemplateRetrievalMiss,
     TemplateRetrievalQuery,
+    TemplateSearchIntent,
     _component_templates_for_capability,
     _limit_component_templates,
     _required_field_template_groups,
     build_template_retrieval_prompt,
     restrict_query_to_preferred_templates,
     retrieve_template_variants,
+    search_template_variants,
 )
 from services.template_generation.engine.compact_dsl_a2ui_converter import (
     convert_a2ui_to_compact_dsl,
@@ -480,7 +482,7 @@ def test_specialized_weather_focus_routes_to_ux_template(
                 {},
                 {
                     "temperatureRangeText": _field("25℃ / 32℃"),
-                    "rainProbabilityPercent": _field("20%"),
+                    "rainProbabilityPercent": _field(20, "number"),
                 },
             ],
             (
@@ -814,6 +816,10 @@ def test_first_layer_prompt_includes_task_fields_rules_and_action_candidates() -
     assert "不得为了迁就布局限制而省略" in messages[0]["content"]
     assert "这些组合约束由服务端 Planner" in messages[0]["content"]
     assert "不得判断业务是否能组成布局" in messages[0]["content"]
+    assert "默认心率展示字段 /exerciseHeartRateAvg" in messages[0]["content"]
+    assert messages[0]["content"].index("天气卡片的默认基础展示字段") < messages[0][
+        "content"
+    ].index("默认心率展示字段 /exerciseHeartRateAvg")
 
 
 def test_calendar_first_layer_rule_excludes_meeting_action_parameters() -> None:
@@ -909,18 +915,20 @@ def test_search_supports_2x4_prompt_and_composition_slot_retrieval() -> None:
 
 def test_search_rejects_two_data_businesses() -> None:
     task = _task()
-    task.dataModelSchema["data"]["systemMem"] = {
-        "usagePercent": _field(65, "number"),
-        "availableMemText": _field("4.2 GB"),
-        "totalMemText": _field("12 GB"),
+    task.dataModelSchema["data"]["phoneBattery"] = {
+        "batteryCapacityLevelDesc": _field("正常"),
+        "batterySOC": _field(65, "integer"),
+        "batterySOCText": _field("65%"),
+        "chargingStatusDesc": _field("未充电"),
     }
-    memory = CandidateDataBinding(
-        capabilityId="GetSystemMemInfo",
-        writeResultTo="/data/systemMem",
+    battery = CandidateDataBinding(
+        capabilityId="GetPhoneBatteryInfo",
+        writeResultTo="/data/phoneBattery",
         candidateOutputFields=[
-            "/usagePercent",
-            "/availableMemText",
-            "/totalMemText",
+            "/batteryCapacityLevelDesc",
+            "/batterySOC",
+            "/batterySOCText",
+            "/chargingStatusDesc",
         ],
     )
     with pytest.raises(TemplateRetrievalMiss, match="multiple data businesses"):
@@ -934,22 +942,23 @@ def test_search_rejects_two_data_businesses() -> None:
                         "/current/condition",
                         "/current/coldLevel",
                     ),
-                    "GetSystemMemInfo": (
-                        "/usagePercent",
-                        "/availableMemText",
-                        "/totalMemText",
+                    "GetPhoneBatteryInfo": (
+                        "/batteryCapacityLevelDesc",
+                        "/batterySOC",
+                        "/batterySOCText",
+                        "/chargingStatusDesc",
                     ),
                 },
             ),
             task,
             CardPlanRegistry(),
-            (_binding(), memory),
+            (_binding(), battery),
             {
                 "dataBindings": [
                     {"capabilityId": "ViewWeather", "writeResultTo": "/data/weather"},
                     {
-                        "capabilityId": "GetSystemMemInfo",
-                        "writeResultTo": "/data/systemMem",
+                        "capabilityId": "GetPhoneBatteryInfo",
+                        "writeResultTo": "/data/phoneBattery",
                     },
                 ]
             },
@@ -1424,9 +1433,11 @@ def test_q004_weather_alert_fields_match_alert_full() -> None:
         _card_spec(),
     )
 
-    assert result.component_candidates[0].available_template_ids == (
+    # 候选元组的顺序随注册表迭代不稳定，多成员一律按排序比较。
+    assert sorted(result.component_candidates[0].available_template_ids) == [
         "WeatherOverviewAlertFull@1",
-    )
+        "WeatherOverviewUpdatedAtFull@1",
+    ]
 
 
 def test_q025_weather_wind_fields_match_wind_hero() -> None:
@@ -1490,10 +1501,11 @@ def test_q025_weather_wind_fields_match_wind_hero() -> None:
 
     # 风况字段同时精确覆盖 WindFull（风向+风力为主数据）与 WindHero 的契约，
     # 两者都进入候选（与 q001 的 Full+Hero 组合一致）。
-    assert result.component_candidates[0].available_template_ids == (
+    assert sorted(result.component_candidates[0].available_template_ids) == [
+        "WeatherOverviewUpdatedAtFull@1",
         "WeatherOverviewWindFull@1",
         "WeatherOverviewWindHero@1",
-    )
+    ]
 
 
 def test_q034_two_weather_bindings_match_dual_city_full() -> None:
@@ -1928,10 +1940,11 @@ def test_search_without_action_keeps_only_full_candidates() -> None:
     template_ids = set(result.component_candidates[0].available_template_ids)
     # AlertInfoFull / UpdatedAtFull share Full@1's primary/secondary contract,
     # so the condition-only query matches them too.
+    # UpdatedAtFull 的 updatedAt 已改为必出主数据，本意图不提供 updatedAt，
+    # 不再进入候选。
     assert template_ids == {
         "WeatherOverviewFull@1", "WeatherOverviewAlertInfoFull@1",
         "WeatherOverviewConditionFeelsLikeAlertFull@1",
-        "WeatherOverviewUpdatedAtFull@1",
     }
 
 
@@ -2709,3 +2722,125 @@ def test_earphone_battery_2x4_composes_two_focus_panels_with_two_actions() -> No
     assert not battery_plugged_ids
     assert earphone_status_ids <= descendant_ids(row_children[0])
     assert battery_percent_ids <= descendant_ids(row_children[1])
+
+
+def test_required_uncovered_capability_must_not_be_silently_dropped() -> None:
+    """模板未承载的用户必选能力必须整体拒绝，禁止静默丢弃成单业务。"""
+    intent = TemplateSearchIntent(
+        requiredOutputFieldsByCapability={
+            "ViewWeather": ("/current/temperatureText",),
+            "GetAppPowerConsumptionRanking": ("/rankingList/0/powerText",),
+        },
+    )
+    task = _task()
+    task.dataModelSchema["data"]["powerRanking"] = {
+        "rankingList": [{"powerText": _field("53%")}],
+    }
+    ranking_binding = CandidateDataBinding(
+        capabilityId="GetAppPowerConsumptionRanking",
+        writeResultTo="/data/powerRanking",
+        candidateOutputFields=["/rankingList/0/powerText"],
+    )
+    card_spec = _card_spec()
+    card_spec["dataBindings"].append(
+        {"capabilityId": "GetAppPowerConsumptionRanking", "writeResultTo": "/data/powerRanking"},
+    )
+
+    with pytest.raises(
+        TemplateRetrievalMiss,
+        match=(
+            "no provider template covers capability GetAppPowerConsumptionRanking"
+        ),
+    ):
+        search_template_variants(
+            intent, task, get_cardplan_registry(), (_binding(), ranking_binding), card_spec,
+        )
+
+
+def _current_time_task() -> TaskSpec:
+    return TaskSpec(
+        userQuery="显示当前时间",
+        size="2x2",
+        dataModelSchema={
+            "data": {
+                "currentTime": {
+                    "currentDate": _field("2026-07-09"),
+                    "dayOfWeek": _field("星期四"),
+                    "lunarDate": _field("六月十五"),
+                    "updatedAt": _field("2026-07-09 15:30:00"),
+                }
+            }
+        },
+    )
+
+
+def _current_time_binding() -> CandidateDataBinding:
+    return CandidateDataBinding(
+        capabilityId="GetCurrentTime",
+        writeResultTo="/data/currentTime",
+        candidateOutputFields=[
+            "/currentDate",
+            "/dayOfWeek",
+            "/lunarDate",
+            "/updatedAt",
+        ],
+    )
+
+
+def _current_time_card_spec() -> dict[str, Any]:
+    return {
+        "suggestSize": "2x2",
+        "dataBindings": [
+            {"capabilityId": "GetCurrentTime", "writeResultTo": "/data/currentTime"}
+        ],
+    }
+
+
+def test_current_time_updated_fields_search_includes_updated_full_and_support() -> None:
+    """只要更新时间时，CurrentTimeOverview 必须给出 UpdatedFull 与 Support 候选。"""
+    intent = TemplateSearchIntent(
+        requiredOutputFieldsByCapability={"GetCurrentTime": ("/updatedAt",)},
+        primaryOutputFieldByCapability={"GetCurrentTime": "/updatedAt"},
+    )
+    result = search_template_variants(
+        intent,
+        _current_time_task(),
+        get_cardplan_registry(),
+        (_current_time_binding(),),
+        _current_time_card_spec(),
+    )
+
+    groups = [
+        group for group in result.business_candidates if group.business_id == "CurrentTimeOverview"
+    ]
+    assert len(groups) == 1
+    candidates = {candidate.template_id: candidate for candidate in groups[0].candidates}
+    assert "CurrentTimeOverviewUpdatedFull@1" in candidates
+    assert "CurrentTimeOverviewSupport@1" in candidates
+    assert all(
+        "/updatedAt" in candidate.covered_explicit_fields
+        for candidate in candidates.values()
+    )
+
+
+def test_current_time_date_fields_search_includes_date_full() -> None:
+    """只要今天日期时，CurrentTimeOverview 必须给出 DateFull 候选。"""
+    intent = TemplateSearchIntent(
+        requiredOutputFieldsByCapability={"GetCurrentTime": ("/currentDate",)},
+        primaryOutputFieldByCapability={"GetCurrentTime": "/currentDate"},
+    )
+    result = search_template_variants(
+        intent,
+        _current_time_task(),
+        get_cardplan_registry(),
+        (_current_time_binding(),),
+        _current_time_card_spec(),
+    )
+
+    groups = [
+        group for group in result.business_candidates if group.business_id == "CurrentTimeOverview"
+    ]
+    assert len(groups) == 1
+    assert "CurrentTimeOverviewDateFull@1" in {
+        candidate.template_id for candidate in groups[0].candidates
+    }

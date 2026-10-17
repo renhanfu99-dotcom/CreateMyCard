@@ -173,13 +173,13 @@
                 "unitIncluded": true
               },
               "rainProbabilityPercent": {
-                "type": "string",
-                "description": "可直接显示的白天降雨概率文本，已包含“%”单位；展示时不得再次追加“%”。例如“20%”。",
-                "sampleValue": "20%",
+                "type": "number",
+                "description": "白天降雨概率的百分数数值，返回值不包含单位，例如 20 表示 20%；文本展示必须追加一个“%”，进度组件直接使用数值。",
+                "sampleValue": 20,
                 "displayUnits": [
                   "%"
                 ],
-                "unitIncluded": true
+                "unitIncluded": false
               },
               "airQuality": {
                 "type": "string",
@@ -403,7 +403,7 @@
   },
   {
     "id": "GetEarphoneInfo",
-    "description": "查询当前手机连接的蓝牙耳机状态，包括耳机名称、主盒与左右耳的当前独立剩余电量百分比，以及它们各自的充电状态。注意，当前对于非华为耳机设备，只能查询到名称，其它信息均查询不到，返回为\"--\"，可在适当时机告诉用户这个事项。",
+    "description": "查询当前手机通过蓝牙连接的耳机状态，包括耳机名称、主盒与左右耳的当前独立剩余电量百分比，以及它们各自的充电状态。注意：本能力仅支持蓝牙连接，不支持星闪连接；耳机通过星闪连接时无法获取实际数据。使用本能力时须明确告知用户这一限制，并提示使用蓝牙连接耳机。对于非华为耳机设备，只能查询到名称，其它信息均查询不到，返回为\"--\"，须在适用时告知用户这一限制。",
     "defaultWriteResultTo": "/data/earphone",
     "dependencies": {
       "requiredPackages": []

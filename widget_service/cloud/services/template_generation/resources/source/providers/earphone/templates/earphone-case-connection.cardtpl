@@ -22,7 +22,7 @@ Column({"_advancedComponent": "BluetoothDeviceOverview", "width": "matchParent",
 )
 #End
 
-#Template BluetoothDeviceOverviewCaseConnectionCompact@1(props: { caseIcon?: asset })
+#Template BluetoothDeviceOverviewConnectionBatterySupport@1(props: { caseIcon?: asset })
 data = { battery: $path("/batteryLevel"), connected: $path("/isConnected") }
 Column(
     {
@@ -31,9 +31,6 @@ Column(
         "height": "matchParent",
         "itemMargin": 4,
         "justifyContent": "center",
-        "padding": {"left": 12, "top": 8, "right": 12, "bottom": 8},
-        "backgroundColor": $theme("supportContentStyle.backgroundColor"),
-        "borderRadius": $theme("supportContentStyle.borderRadius"),
         "alignItems": "start",
         "clip": true,
         "constraintSize": {
@@ -51,7 +48,8 @@ Column(
         },
         Column(
             {
-                "width": "matchParent",
+                "layoutWeight": 1,
+                "constraintSize": {"minWidth": 0},
                 "height": "matchParent",
                 "itemMargin": 4,
                 "justifyContent": "center",
@@ -70,6 +68,9 @@ Column(
                 props.caseIcon,
                 { "width": 24, "height": 24, "fillColor": $theme('supportContentColor') }
             ),
+        #else
+            Text("耳机盒", {"width": 30, "height": 16, "fontSize": 10, "fontWeight": 400,
+                "fontColor": $theme('supportContentColor'), "maxLines": 1, "flexShrink": 0}),
         #endif
     )
 )

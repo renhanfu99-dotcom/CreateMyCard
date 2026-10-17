@@ -13,6 +13,7 @@ from .business_actions import matches_business_data, supports_business_action
 from .models import (
     ActionBinding,
     TemplateDefinition,
+    TemplateNode,
     TemplatePlanActionAssignment,
     TemplatePlanBusinessSlot,
 )
@@ -27,6 +28,7 @@ from .template_retrieval import (
     TemplateBusinessCandidates,
     TemplateSearchIntent,
     TemplateSearchResult,
+    _template_available_data_fields,
     template_required_assets_are_available,
 )
 
@@ -51,6 +53,9 @@ class WideLayoutOption:
     action_owners: tuple[int | None, ...] = ()
     # 该形态没有独立 Action 槽位，允许单动作内嵌进某个业务模板根节点。
     allows_embedded_action: bool = False
+    # 部分布局的槽位高度是固定预算。声明后，Planner 会在生成组合时先做
+    # 业务模板的静态最小高度预检，避免把必然溢出的组合交给第二层模型。
+    slot_height_budgets: tuple[int | None, ...] = ()
 
 
 # 顺序只用于同分方案的稳定择优；不得因前一形态不成立而拒绝后续形态。
@@ -60,6 +65,20 @@ _WIDE_LAYOUTS = (
     WideLayoutOption("WideTwoFullLayout", ("Full", "Full")),
     WideLayoutOption("WideTwoHalfLayout", ("WideHalf", "WideHalf")),
     WideLayoutOption("WideHeroCompactLayout", ("Hero", "Compact")),
+    # 2x4 的窄业务槽位语义是 Support。旧 Compact 形态保留在后面，
+    # 仅用于兼容尚未迁移的历史 Provider。
+    WideLayoutOption(
+        "WideFullTwoCompactLayout", ("Full", "Support"), ("CompactSubtitleAction",), (None,)
+    ),
+    WideLayoutOption(
+        "WideFullTwoCompactLayout", ("Full", "Support", "Support"), allows_embedded_action=True
+    ),
+    WideLayoutOption(
+        "WideFullTwoCompactLayout", ("Hero", "Support"), ("CompactAction",), (None,)
+    ),
+    WideLayoutOption(
+        "WideFullTwoCompactLayout", ("Full", "Support", "Support"), allows_embedded_action=True
+    ),
     WideLayoutOption(
         "WideFullTwoCompactLayout", ("Full", "Compact", "Compact"), allows_embedded_action=True
     ),
@@ -78,8 +97,20 @@ _WIDE_LAYOUTS = (
         "WideHalfTwoCompactLayout", ("WideHalf", "Compact"), ("CompactAction",), (None,)
     ),
     WideLayoutOption("WideFullTwoCompactLayout", ("Hero", "Compact"), ("CompactAction",), (None,)),
-    WideLayoutOption("WideTwoFocusTwoActionLayout", ("Hero", "Hero"), ("PillAction",) * 2, (0, 1)),
-    WideLayoutOption("WideTwoHeroActionLayout", ("Hero", "Hero"), ("PillAction",) * 2, (0, 1)),
+    WideLayoutOption(
+        "WideTwoFocusTwoActionLayout",
+        ("Hero", "Hero"),
+        ("PillAction",) * 2,
+        (0, 1),
+        slot_height_budgets=(66, 66),
+    ),
+    WideLayoutOption(
+        "WideTwoHeroActionLayout",
+        ("Hero", "Hero"),
+        ("PillAction",) * 2,
+        (0, 1),
+        slot_height_budgets=(58, 58),
+    ),
     WideLayoutOption("WideFullHeroTwoActionLayout", ("Full", "Hero"), ("PillAction",) * 2, (1, 1)),
     WideLayoutOption("WideFullTwoCompactLayout", ("Full",), ("CompactAction",) * 2, (None, None)),
     WideLayoutOption(
@@ -141,7 +172,20 @@ def wide_plan_compositions(
         # 动作不必再挤进 PillAction 行；伴生槽位不承载显式字段。
         slot_options: tuple[tuple[TemplatePlanBusinessSlot, ...], ...] = (slots,)
         if len(actions) == 1 and len(slots) < 4:
-            companions = _companion_action_slots(slots, actions, registry, task)
+            available_fields_by_capability: dict[str, set[str]] = {}
+            for group in search_result.business_candidates:
+                available_fields_by_capability.setdefault(group.capability_id, set()).update(
+                    path
+                    for candidate in group.candidates
+                    for path in candidate.available_data_fields
+                )
+            companions = _companion_action_slots(
+                slots,
+                actions,
+                registry,
+                task,
+                available_fields_by_capability,
+            )
             slot_options += tuple((*slots, companion) for companion in companions)
         for option_slots in slot_options:
             for layout_rank, layout in enumerate(_WIDE_LAYOUTS):
@@ -159,6 +203,8 @@ def wide_plan_compositions(
                 if not embedded and len(layout.action_templates) != len(actions):
                     continue
                 for ordered in _ordered_slots(option_slots, layout.roles):
+                    if not _layout_geometry_fits(layout, ordered, registry):
+                        continue
                     for assignments in _action_assignments(
                         layout, ordered, actions, registry, task, embedded
                     ):
@@ -169,6 +215,177 @@ def wide_plan_compositions(
                         yield WidePlanComposition(
                             f"{layout.layout_id}@1", ordered, assignments, layout_rank
                         )
+
+
+def _layout_geometry_fits(
+    layout: WideLayoutOption,
+    slots: tuple[TemplatePlanBusinessSlot, ...],
+    registry: CardPlanRegistry,
+) -> bool:
+    """Reject deterministic geometry overflows before second-layer selection.
+
+    The prediction intentionally uses the provider blueprint rather than the
+    LLM-filled parameters. Fixed text/icon heights and vertical gaps are
+    already part of the trusted template definition, so this is conservative:
+    a template is rejected when its declared minimum content cannot fit the
+    slot, while flexible templates remain eligible.
+    """
+    if not layout.slot_height_budgets:
+        return True
+    if len(layout.slot_height_budgets) != len(slots):
+        return False
+    for slot, budget in zip(slots, layout.slot_height_budgets, strict=True):
+        if budget is None:
+            continue
+        required_height = _template_intrinsic_height(slot.template_id, registry)
+        if required_height > budget:
+            return False
+    return True
+
+
+def _template_intrinsic_height(template_id: str, registry: CardPlanRegistry) -> int:
+    """Estimate a business template's natural vertical requirement.
+
+    ``matchParent`` is deliberately ignored here: it is a flexible request,
+    not an intrinsic minimum. Numeric heights, vertical padding, item margins,
+    and the largest branch of paired template conditionals are retained.
+    """
+    definition = registry.require_template(template_id)
+    variants = tuple(
+        variant
+        for variant in definition.variants
+        if not variant.supported_card_sizes or "2x4" in variant.supported_card_sizes
+    ) or definition.variants
+    return max((_template_node_intrinsic_height(variant.root) for variant in variants), default=0)
+
+
+def _template_node_intrinsic_height(node: TemplateNode) -> int:
+    if node.component in {
+        "IfParam",
+        "IfMissingParam",
+        "IfBind",
+        "IfMissingBind",
+        "IfAllBind",
+        "IfAnyBind",
+        "IfAllMissingBind",
+        "IfAnyMissingBind",
+    }:
+        return _template_sequence_intrinsic_height(node.children)
+
+    options = _template_node_options(node)
+    explicit_height = options.get("height")
+    fixed_height = int(explicit_height) if isinstance(explicit_height, (int, float)) else 0
+    children_height = _template_sequence_intrinsic_height(node.children)
+    component = node.component
+    if component in {"Row", "Stack"}:
+        natural_height = max((
+            _template_node_intrinsic_height(child) for child in node.children
+        ), default=24)
+    elif component in {"Column", "List"}:
+        margin = options.get("itemMargin", options.get("space", 4))
+        margin_value = int(margin) if isinstance(margin, (int, float)) else 4
+        natural_height = children_height + max(
+            0, _template_sequence_effective_count(node.children) - 1
+        ) * margin_value
+    else:
+        natural_height = {
+            "Text": 20,
+            "Image": 24,
+            "Progress": 40,
+            "Button": 32,
+            "Divider": 0,
+        }.get(component, 20)
+        if node.children:
+            natural_height = max(natural_height, children_height)
+
+    # A primitive's explicit height is its actual line/icon height. For
+    # containers, retain the larger of the fixed slot and natural children so
+    # the predictor remains conservative when a blueprint itself is too tight.
+    if component not in {"Row", "Stack", "Column", "List"} and fixed_height:
+        natural_height = fixed_height
+
+    padding = options.get("padding")
+    if isinstance(padding, dict):
+        natural_height += sum(
+            int(padding.get(edge, 0))
+            for edge in ("top", "bottom")
+            if isinstance(padding.get(edge, 0), (int, float))
+        )
+    return max(fixed_height, natural_height)
+
+
+def _template_sequence_intrinsic_height(children: tuple[TemplateNode, ...]) -> int:
+    total = 0
+    index = 0
+    while index < len(children):
+        current = children[index]
+        if index + 1 < len(children) and _are_conditional_pair(current, children[index + 1]):
+            total += max(
+                _template_node_intrinsic_height(current),
+                _template_node_intrinsic_height(children[index + 1]),
+            )
+            index += 2
+            continue
+        total += _template_node_intrinsic_height(current)
+        index += 1
+    return total
+
+
+def _template_sequence_effective_count(children: tuple[TemplateNode, ...]) -> int:
+    """Count rendered children while collapsing paired conditional branches."""
+    count = 0
+    index = 0
+    while index < len(children):
+        count += 1
+        if index + 1 < len(children) and _are_conditional_pair(
+            children[index], children[index + 1]
+        ):
+            index += 2
+        else:
+            index += 1
+    return count
+
+
+def _are_conditional_pair(first: TemplateNode, second: TemplateNode) -> bool:
+    complements = {
+        "IfParam": "IfMissingParam",
+        "IfMissingParam": "IfParam",
+        "IfBind": "IfMissingBind",
+        "IfMissingBind": "IfBind",
+        "IfAllBind": "IfAnyMissingBind",
+        "IfAnyMissingBind": "IfAllBind",
+        "IfAnyBind": "IfAllMissingBind",
+        "IfAllMissingBind": "IfAnyBind",
+    }
+    if complements.get(first.component) != second.component:
+        return False
+    if not first.values or not second.values:
+        return True
+    return first.values[0].model_dump(mode="json") == second.values[0].model_dump(mode="json")
+
+
+def _template_node_options(node: TemplateNode) -> dict[str, object]:
+    for value in node.values:
+        if value.kind == "object":
+            return {
+                key: _template_value_literal(item)
+                for key, item in value.properties.items()
+                if item.kind in {"literal", "object"}
+            }
+    return {}
+
+
+def _template_value_literal(value: object) -> object:
+    if not hasattr(value, "kind"):
+        return None
+    if value.kind == "literal":
+        return value.value
+    if value.kind == "object":
+        return {
+            key: _template_value_literal(item)
+            for key, item in value.properties.items()
+        }
+    return None
 
 
 def _required_business_actions_are_assigned(
@@ -205,8 +422,9 @@ def _companion_action_slots(
     actions: tuple[ActionBinding, ...],
     registry: CardPlanRegistry,
     task: TaskSpec,
+    available_fields_by_capability: dict[str, set[str]],
 ) -> tuple[TemplatePlanBusinessSlot, ...]:
-    """为已选业务枚举可承载单动作的伴生 Compact 槽位。
+    """为已选业务枚举可承载单动作的伴生 Compact 或 Support 槽位。
 
     伴生模板虽然不承载显式字段、不进入 Search 显式字段候选，仍必须先通过
     与普通候选等价的准入检查（尺寸、必需数据、必需素材、事件），
@@ -215,20 +433,63 @@ def _companion_action_slots(
     results: list[TemplatePlanBusinessSlot] = []
     seen: set[tuple[str, str]] = {(slot.business_id, slot.template_id) for slot in slots}
     capability_by_business = {slot.business_id: slot.capability_id for slot in slots}
+    already_rendered_fields: set[str] = set()
+    for slot in slots:
+        definition = registry.require_template(slot.template_id)
+        already_rendered_fields.update(
+            _rendered_template_fields(
+                definition,
+                task,
+                available_fields_by_capability.get(slot.capability_id, set()),
+            )
+        )
+        already_rendered_fields.update(slot.field_bindings.values())
     for action in actions:
         for business_id in sorted(capability_by_business):
             component = registry.require_ux_business_component(business_id)
-            for template_id in registry.enabled_template_ids(component.local_template_ids):
+            companion_template_ids = tuple(
+                sorted(
+                    registry.enabled_template_ids(component.local_template_ids),
+                    key=lambda template_id: (
+                        provider_template_layout_kind(template_id) != "Support",
+                        template_id,
+                    ),
+                )
+            )
+            for template_id in companion_template_ids:
                 if (business_id, template_id) in seen:
                     continue
-                if provider_template_layout_kind(template_id) != "Compact":
+                template_kind = provider_template_layout_kind(template_id)
+                if template_kind not in {"Support", "Compact"}:
                     continue
                 definition = registry.require_template(template_id)
                 if not template_required_assets_are_available(definition, task):
                     continue
                 if not _required_data_available(definition, task):
                     continue
-                if not supports_business_action(definition, action, "2x4"):
+                if template_kind == "Support":
+                    support_fields = _rendered_template_fields(
+                        definition,
+                        task,
+                        available_fields_by_capability.get(
+                            capability_by_business[business_id], set()
+                        ),
+                    )
+                    # A layout-owned Support must add a metric or consume its own action.
+                    # a Support that only repeats the Full's city/temperature/
+                    # condition fields to fill an empty action-side slot.
+                    adds_information = bool(support_fields.difference(already_rendered_fields))
+                    consumes_action = supports_business_action(definition, action, "2x4")
+                    if not adds_information and not consumes_action:
+                        continue
+                # A Support companion is rendered in a layout-owned slot and
+                # the action is consumed by the sibling root Action slot. It
+                # therefore does not need to declare the event itself. Legacy
+                # Compact companions still require their historical business
+                # action contract.
+                if template_kind != "Support" and not supports_business_action(
+                    definition, action, "2x4"
+                ):
                     continue
                 seen.add((business_id, template_id))
                 results.append(
@@ -237,7 +498,7 @@ def _companion_action_slots(
                         businessId=business_id,
                         capabilityId=capability_by_business[business_id],
                         templateId=template_id,
-                        layoutRole="Compact",
+                        layoutRole=template_kind,
                         coveredExplicitFields=(),
                         primaryMatchedFields=(),
                     )
@@ -245,13 +506,41 @@ def _companion_action_slots(
     return tuple(results)
 
 
+def _rendered_template_fields(
+    definition: TemplateDefinition,
+    task: TaskSpec,
+    candidate_paths: set[str],
+) -> set[str]:
+    """Return only fields whose conditional branch actually renders this input.
+
+    Provider ``primaryData``/``secondaryData`` describes coverage eligibility,
+    not necessarily the fields emitted by every conditional branch.  Companion
+    Support selection must use the latter, otherwise an optional field already
+    rendered by the main template looks like new information.
+    """
+    if not definition.data_domain:
+        return set()
+    rendered = _template_available_data_fields(
+        definition,
+        task,
+        (definition.data_domain,),
+        candidate_paths,
+        rendered_only=True,
+    )
+    prefix = definition.data_domain.rstrip("/")
+    return {
+        path.removeprefix(prefix)
+        for path in rendered
+        if path.startswith(f"{prefix}/")
+    }
+
+
 def _required_data_available(definition: TemplateDefinition, task: TaskSpec) -> bool:
     """伴生模板的必需数据路径必须能在 TaskSpec 数据模型中解析到。"""
     data = task.dataModelSchema.get("data") if isinstance(task.dataModelSchema, dict) else None
-    for path in definition.required_data:
-        node: Any = data
-        segments = path.strip("/").split("/")
-        for segment in segments[1:]:
+
+    def resolves(node: Any, segments: list[str]) -> bool:
+        for segment in segments:
             if isinstance(node, list):
                 if not segment.isdigit() or int(segment) >= len(node):
                     return False
@@ -260,6 +549,20 @@ def _required_data_available(definition: TemplateDefinition, task: TaskSpec) -> 
             if not isinstance(node, dict) or segment not in node:
                 return False
             node = node[segment]
+        return True
+
+    for path in definition.required_data:
+        segments = path.strip("/").split("/")
+        # Provider paths are relative to the capability root (for example
+        # ``/current/humidityPercent``), while TaskSpec stores that root below
+        # ``data.weather``. Try the complete data object and each capability
+        # root; the previous implementation skipped the first path segment and
+        # incorrectly rejected valid Support companions.
+        roots = [data]
+        if isinstance(data, dict):
+            roots.extend(value for value in data.values() if isinstance(value, (dict, list)))
+        if not any(resolves(root, segments) for root in roots):
+            return False
     return True
 
 
@@ -349,7 +652,7 @@ def _may_pair_with_selected(
     if slot.field_bindings:
         return False
     kind = provider_template_layout_kind(slot.template_id)
-    if kind not in {"Full", "Compact"}:
+    if kind not in {"Full", "Compact", "Support"}:
         return False
     same_business = [
         item
@@ -359,7 +662,7 @@ def _may_pair_with_selected(
     if len(same_business) != 1:
         return False
     other_kind = provider_template_layout_kind(same_business[0].template_id)
-    return other_kind in {"Full", "Compact"} and other_kind != kind
+    return other_kind in {"Full", "Compact", "Support"} and other_kind != kind
 
 
 def _generic_field_options(

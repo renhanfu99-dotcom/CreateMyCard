@@ -35,6 +35,9 @@ from .wide_template_planner import wide_plan_compositions
 _MAX_PLANS = 3
 _PILL_ACTION_TEMPLATE_ID = "PillAction@1"
 _ICON_ACTION_TEMPLATE_ID = "IconAction@1"
+# 只能作为配对业务出现的组件：不允许单独成卡（无单业务方案）。
+# CurrentTimeOverview 的时间/日期信息仅作为其它业务卡片的补充行（TwoSupportLayout）。
+_PAIRING_ONLY_BUSINESS_IDS = frozenset({"CurrentTimeOverview"})
 _COUNTDOWN_DATE_PATTERN = re.compile(r"(?:\d{4}\s*[年/-]\s*)?\d{1,2}\s*[月/-]\s*\d{1,2}\s*[日号]?")
 _COUNTDOWN_HOLIDAY_TERMS = (
     "元旦",
@@ -160,6 +163,13 @@ def plan_template_candidates(
         if preferred:
             drafts = preferred
 
+    earphone_ranking = (
+        task_spec.size == "2x2"
+        and requested_capabilities == ("GetEarphoneInfo",)
+    )
+    if earphone_ranking:
+        drafts = _prefer_earphone_action_role(drafts, len(action_ids))
+
     battery_ranking = (
         task_spec.size == "2x2"
         and requested_capabilities == ("GetPhoneBatteryInfo",)
@@ -203,6 +213,23 @@ def plan_template_candidates(
         item.plan.model_copy(update={"plan_id": f"plan-{index + 1}"})
         for index, item in enumerate(selected)
     )
+
+
+def _prefer_earphone_action_role(drafts: list[_PlanDraft], action_count: int) -> list[_PlanDraft]:
+    """Choose the action-compatible role before comparing focus or field scores."""
+    roles = ("Full",)
+    if action_count == 1:
+        roles = ("Hero", "Full")
+    elif action_count == 2:
+        roles = ("Compact",)
+    for role in roles:
+        matching = []
+        for draft in drafts:
+            if draft.plan.business_slots[0].layout_role == role:
+                matching.append(draft)
+        if matching:
+            return matching
+    return drafts
 
 
 def _verify_plans_cover_request(
@@ -423,6 +450,9 @@ def _single_business_drafts(
     registry: CardPlanRegistry,
 ) -> tuple[tuple[TemplatePlan, tuple[int, ...]], ...]:
     if task_spec.size != "2x2":
+        return ()
+    if group.business_id in _PAIRING_ONLY_BUSINESS_IDS:
+        # 配对专用业务不生成单业务方案；仅含该业务时整体不可成卡。
         return ()
     layouts: tuple[tuple[str, str, str | None], ...]
     if not action_ids:
@@ -779,6 +809,8 @@ class _WidePlanScore(NamedTuple):
     """Wide 组合计划的排序分值，各字段按字典序参与比较。"""
 
     embedded_action_count: int
+    support_slot_count: int
+    support_novelty_count: int
     focus_match_count: int
     generic_slot_penalty: int
     slot_count_penalty: int
@@ -798,11 +830,26 @@ def _wide_plan_score(
     base = _plan_score(plan, intent, registry, groups)
     generic_count = sum(bool(slot.field_bindings) for slot in plan.business_slots)
     embedded_count = sum(item.consumer == "business-template" for item in plan.action_assignments)
+    support_slots = [slot for slot in plan.business_slots if slot.layout_role == "Support"]
+    support_novelty = 0
+    for support_index, slot in enumerate(plan.business_slots):
+        if slot.layout_role != "Support":
+            continue
+        definition = registry.require_template(slot.template_id)
+        support_fields = set(definition.primary_data) | set(definition.secondary_data)
+        other_fields: set[str] = set()
+        for other_index, other in enumerate(plan.business_slots):
+            if other_index == support_index or other.business_id != slot.business_id:
+                continue
+            other_fields.update(other.covered_explicit_fields)
+        support_novelty += len(support_fields - other_fields)
     requested_order = tuple(intent.required_output_fields_by_capability)
     actual_order = tuple(dict.fromkeys(slot.capability_id for slot in plan.business_slots))
     order_matches = int(actual_order == requested_order)
     return _WidePlanScore(
         embedded_action_count=embedded_count,
+        support_slot_count=len(support_slots),
+        support_novelty_count=support_novelty,
         focus_match_count=base[0],
         generic_slot_penalty=-generic_count,
         slot_count_penalty=-len(plan.business_slots),

@@ -11,7 +11,11 @@ from services.template_generation.engine.cardplan.compiler import (
     _expand_health_metric_generic_template,
     _validate_allowed_template_plan,
 )
-from services.template_generation.engine.cardplan.models import HybridBodyContract, HybridLimits
+from services.template_generation.engine.cardplan.models import (
+    HybridBodyContract,
+    HybridLimits,
+    TemplatePlanBusinessSlot,
+)
 from services.template_generation.engine.cardplan.parser import parse_ux_layout_card
 from services.template_generation.engine.cardplan.prompt import action_bindings
 from services.template_generation.engine.cardplan.registry import get_cardplan_registry
@@ -23,6 +27,11 @@ from services.template_generation.engine.cardplan.template_retrieval import (
     TemplateSearchIntent,
     build_template_retrieval_prompt,
     search_template_variants,
+)
+from services.template_generation.engine.cardplan.wide_template_planner import (
+    _WIDE_LAYOUTS,
+    _layout_geometry_fits,
+    _template_intrinsic_height,
 )
 from services.template_generation.engine.pipeline import (
     TemplateGenerationError,
@@ -159,6 +168,79 @@ def _contract(plans, task):
             vertical_budget_vp=136,
         ),
     )
+
+
+def test_wide_two_hero_action_rejects_hero_templates_that_overflow_slot_budget() -> None:
+    registry = get_cardplan_registry()
+    layout = next(item for item in _WIDE_LAYOUTS if item.layout_id == "WideTwoHeroActionLayout")
+
+    def slot(template_id: str, position: int) -> TemplatePlanBusinessSlot:
+        return TemplatePlanBusinessSlot(
+            position=position,
+            businessId="test-business",
+            capabilityId="test-capability",
+            templateId=template_id,
+            layoutRole="Hero",
+        )
+
+    assert _template_intrinsic_height("CountdownOverviewEventHero@1", registry) == 62
+    assert _template_intrinsic_height("ScheduleOverviewMeetingEntryHero@1", registry) == 74
+    assert not _layout_geometry_fits(
+        layout,
+        (
+            slot("CountdownOverviewEventHero@1", 0),
+            slot("CountdownOverviewEventHero@1", 1),
+        ),
+        registry,
+    )
+    assert not _layout_geometry_fits(
+        layout,
+        (
+            slot("ScheduleOverviewMeetingEntryHero@1", 0),
+            slot("CountdownOverviewEventHero@1", 1),
+        ),
+        registry,
+    )
+
+
+def test_wide_two_hero_action_keeps_a_small_hero_candidate() -> None:
+    registry = get_cardplan_registry()
+    layout = next(item for item in _WIDE_LAYOUTS if item.layout_id == "WideTwoHeroActionLayout")
+    slots = tuple(
+        TemplatePlanBusinessSlot(
+            position=index,
+            businessId="test-business",
+            capabilityId="test-capability",
+            templateId="BatteryOverviewSupportHero@1",
+            layoutRole="Hero",
+        )
+        for index in range(2)
+    )
+    assert _template_intrinsic_height("BatteryOverviewSupportHero@1", registry) <= 58
+    assert _layout_geometry_fits(layout, slots, registry)
+
+
+def test_wide_two_focus_two_action_rejects_the_taller_schedule_hero() -> None:
+    registry = get_cardplan_registry()
+    layout = next(item for item in _WIDE_LAYOUTS if item.layout_id == "WideTwoFocusTwoActionLayout")
+    slots = (
+        TemplatePlanBusinessSlot(
+            position=0,
+            businessId="test-business",
+            capabilityId="test-capability",
+            templateId="ScheduleOverviewMeetingEntryHero@1",
+            layoutRole="Hero",
+        ),
+        TemplatePlanBusinessSlot(
+            position=1,
+            businessId="test-business",
+            capabilityId="test-capability",
+            templateId="CountdownOverviewEventHero@1",
+            layoutRole="Hero",
+        ),
+    )
+    assert layout.slot_height_budgets == (66, 66)
+    assert not _layout_geometry_fits(layout, slots, registry)
 
 
 def test_wide_first_layer_has_no_ui_decision():
@@ -509,7 +591,7 @@ def _weather_earphone_case():
             "data": {
                 "weather": {
                     "current": {"windLevel": _field(4, "integer")},
-                    "daily": [{"rainProbabilityPercent": _field("60%")}],
+                    "daily": [{"rainProbabilityPercent": _field(60, "number")}],
                 },
                 "earphone": {
                     "isConnected": _field(True, "boolean"),
@@ -563,7 +645,7 @@ def _weather_earphone_case():
     return task, bindings, card, intent
 
 
-def test_case_connection_compact_forms_the_reviewed_wide_plan():
+def test_connection_battery_support_forms_the_reviewed_wide_plan():
     task, bindings, card, intent = _weather_earphone_case()
     registry = get_cardplan_registry()
     found = search_template_variants(intent, task, registry, bindings, card)
@@ -571,16 +653,21 @@ def test_case_connection_compact_forms_the_reviewed_wide_plan():
     for group in found.business_candidates:
         if group.capability_id == "GetEarphoneInfo":
             earphone_candidates.update(candidate.template_id for candidate in group.candidates)
-    assert "BluetoothDeviceOverviewCaseConnectionCompact@1" in earphone_candidates
+    assert "BluetoothDeviceOverviewConnectionBatterySupport@1" in earphone_candidates
     plans = plan_template_candidates(intent, found, task, registry)
     first = plans[0]
     assert first.layout_template_id == "WideFullTwoCompactLayout@1"
-    # Q083 评审组合：左侧降水概率 Full，右侧连接 Compact 加歌单入口 Compact，
-    # 音乐动作内嵌进歌单入口 Compact 的根节点底板。
+    # Q083 评审组合：左侧降水概率 Full，右侧连接 Support 加歌单入口 Support，
+    # 音乐动作内嵌进歌单入口 Support 的根节点底板。
     assert [slot.template_id for slot in first.business_slots] == [
         "WeatherOverviewRainWindFull@1",
-        "BluetoothDeviceOverviewCaseConnectionCompact@1",
-        "BluetoothDeviceOverviewMusicCompact@1",
+        "BluetoothDeviceOverviewConnectionBatterySupport@1",
+        "BluetoothDeviceOverviewMusicSupport@1",
+    ]
+    assert [slot.layout_role for slot in first.business_slots] == [
+        "Full",
+        "Support",
+        "Support",
     ]
     assignment = first.action_assignments[0]
     assert assignment.action_id == "event.open.music.favorite"
@@ -606,11 +693,11 @@ async def test_right_two_slot_plan_compiles_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_companion_music_compact_without_music_icon_never_reaches_second_layer():
+async def test_companion_music_support_without_music_icon_never_reaches_second_layer():
     """伴生模板缺少必需素材时不得进入计划：公开入口要么换合法组合，要么明确未命中。
 
     历史缺陷：移除歌单图标后 Planner 仍把要求 `musicIcon` 的
-    `BluetoothDeviceOverviewMusicCompact@1` 放进计划，第二层提示词构建阶段
+    `BluetoothDeviceOverviewMusicSupport@1` 放进计划，第二层提示词构建阶段
     才以 "no complete signature" 整条链路失败。伴生槽位现执行与普通候选
     等价的必需素材/必需数据准入，缺素材时继续寻找合法组合或返回未命中。
     """
@@ -629,8 +716,8 @@ async def test_companion_music_compact_without_music_icon_never_reaches_second_l
 
     output = await generate_template_a2ui(task, card, bindings, model)
     assert model.calls == 1
-    # 依赖音乐图标的 MusicCompact 不得再进入计划，动作改由根 Action 槽位承载，
+    # 依赖音乐图标的 MusicSupport 不得再进入计划，动作改由根 Action 槽位承载，
     # 输出不得引用已被移除的歌单图标，也不得在第二层提示词构建阶段整条失败。
-    assert "MusicCompact" not in output.a2ui
+    assert "MusicSupport" not in output.a2ui
     assert "heart_fill.svg" not in output.a2ui
     assert output.a2ui.count('"call":"clickToDeeplink"') == 1
